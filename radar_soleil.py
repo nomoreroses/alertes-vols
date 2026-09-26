@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Radar ete 2027 : Rennes/Nantes -> ville soleil, A/R sans escale,
-aller <= 50 EUR ET retour <= 50 EUR, sejour de 7 a 21 jours."""
+aller <= 50 EUR ET retour <= 50 EUR, sejour de 7 a 21 jours.
+Deux sources : Google Flights (via SerpApi) + Ryanair (API publique, gratuite)."""
 import os
 import smtplib
 import sqlite3
@@ -13,7 +14,8 @@ SEUIL_TRAJET = 50                      # € max billet aller ET € max billet 
 FENETRE = "2027-07-01,2027-09-03"      # dates de depart possibles
 FIN = "2027-09-10"                     # retour au plus tard
 DUREE = "7,21"                         # duree du sejour en jours
-MAX_VERIFS = 3                         # verifications detaillees max par passage
+MAX_VERIFS = 3                         # verifications SerpApi detaillees max par passage
+DEPARTS = ["NTE", "RNS"]               # aeroports de depart
 VILLES_SOLEIL = {
     "PMI": "Palma", "IBZ": "Ibiza", "AGP": "Malaga", "ALC": "Alicante",
     "BCN": "Barcelone", "LPA": "Gran Canaria – Las Palmas",
@@ -31,6 +33,9 @@ GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 ALERT_TO = os.environ["ALERT_TO"]
 
 URL = "https://serpapi.com/search.json"
+RYANAIR_URL = "https://services-api.ryanair.com/farfnd/v4/roundTripFares"
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36")
 DB = "radar.db"
 
 
@@ -47,7 +52,7 @@ def deals():
     data = get({
         "engine": "google_flights_deals",
         "type": 1,
-        "departure_id": "RNS,NTE",
+        "departure_id": ",".join(DEPARTS),
         "outbound_date": FENETRE,
         "trip_length": DUREE,
         "stops": 1,
@@ -83,6 +88,92 @@ def trajet(departure_id, arrival_id, outbound_date):
     return {"prix": prix, "lien": lien, "compagnie": compagnie}
 
 
+def ryanair_lien(origine, dest, date_out, date_in):
+    return ("https://www.ryanair.com/fr/fr/trip/flights/select?adults=1"
+            f"&isReturn=true&originIata={origine}&destinationIata={dest}"
+            f"&dateOut={date_out}&dateIn={date_in}")
+
+
+def ryanair(depart):
+    """Interroge Ryanair pour un aeroport de depart ; renvoie une liste de bons plans normalises."""
+    debut, fin_dep = FENETRE.split(",")
+    dmin, dmax = DUREE.split(",")
+    params = {
+        "departureAirportIataCode": depart,
+        "outboundDepartureDateFrom": debut,
+        "outboundDepartureDateTo": fin_dep,
+        "inboundDepartureDateFrom": debut,
+        "inboundDepartureDateTo": FIN,
+        "durationFrom": dmin,
+        "durationTo": dmax,
+        "priceValueTo": 2 * SEUIL_TRAJET,   # total A/R <= 2 * seuil (on filtre chaque trajet ensuite)
+        "currency": "EUR",
+        "market": "fr-fr",
+    }
+    try:
+        r = requests.get(RYANAIR_URL, params=params,
+                         headers={"User-Agent": UA, "Accept": "application/json"}, timeout=60)
+        fares = r.json().get("fares", []) or []
+    except (requests.RequestException, ValueError) as e:
+        print(f"[ryanair] {depart}: {e}")
+        return []
+
+    trouves = []
+    for f in fares:
+        out, inb = f.get("outbound"), f.get("inbound")
+        if not out or not inb:
+            continue
+        code = out["arrivalAirport"]["iataCode"]
+        if code not in VILLES_SOLEIL:
+            continue
+        start = out["departureDate"][:10]
+        end = inb["departureDate"][:10]
+        if end > FIN:
+            continue
+        p_aller = out["price"]["value"]
+        p_retour = inb["price"]["value"]
+        if p_aller > SEUIL_TRAJET or p_retour > SEUIL_TRAJET:
+            continue
+        lien = ryanair_lien(depart, code, start, end)
+        trouves.append({
+            "code": code, "ville": VILLES_SOLEIL[code], "start": start, "end": end,
+            "depart": depart,
+            "aller": {"prix": p_aller, "lien": lien, "compagnie": "Ryanair"},
+            "retour": {"prix": p_retour, "lien": lien, "compagnie": "Ryanair"},
+            "total": round(p_aller + p_retour, 2),
+        })
+    return trouves
+
+
+def google_flights():
+    """Bons plans via Google Flights (SerpApi) : deals + verification detaillee."""
+    candidats = []
+    for d in deals():
+        code = d.get("arrival_airport_code")
+        if code not in VILLES_SOLEIL:
+            continue
+        if (d.get("end_date") or "") > FIN:
+            continue
+        candidats.append(d)
+
+    trouves = []
+    for d in candidats[:MAX_VERIFS]:
+        code = d["arrival_airport_code"]
+        start, end = d.get("start_date"), d.get("end_date")
+        aller = trajet(",".join(DEPARTS), code, start)
+        retour = trajet(code, ",".join(DEPARTS), end)
+        if not aller or not retour:
+            continue
+        if aller["prix"] > SEUIL_TRAJET or retour["prix"] > SEUIL_TRAJET:
+            continue
+        trouves.append({
+            "code": code, "ville": VILLES_SOLEIL[code], "start": start, "end": end,
+            "depart": d.get("departure_airport_code", ""),
+            "aller": aller, "retour": retour, "total": round(aller["prix"] + retour["prix"], 2),
+        })
+    return trouves
+
+
 def envoyer_mail(trouves):
     lignes = []
     for t in trouves:
@@ -106,38 +197,20 @@ def main():
     db.execute("CREATE TABLE IF NOT EXISTS alertes (code TEXT PRIMARY KEY, total REAL, ts TEXT)")
     deja = dict(db.execute("SELECT code, total FROM alertes").fetchall())
 
-    # Etape 1 : reperer les A/R prometteurs dans les deals.
-    candidats = []
-    for d in deals():
-        code = d.get("arrival_airport_code")
-        if code not in VILLES_SOLEIL:
-            continue
-        if (d.get("end_date") or "") > FIN:
-            continue
-        prix_deal = d.get("price")
-        if code in deja and prix_deal is not None and deja[code] <= prix_deal:
-            continue
-        candidats.append(d)
+    # Collecte des deux sources.
+    tous = google_flights()
+    for depart in DEPARTS:
+        tous += ryanair(depart)
 
-    # Etape 2 : verifier chaque billet reellement sous le seuil.
-    trouves = []
-    for d in candidats[:MAX_VERIFS]:
-        code = d["arrival_airport_code"]
-        start, end = d.get("start_date"), d.get("end_date")
-        aller = trajet("RNS,NTE", code, start)
-        retour = trajet(code, "RNS,NTE", end)
-        if not aller or not retour:
-            continue
-        if aller["prix"] > SEUIL_TRAJET or retour["prix"] > SEUIL_TRAJET:
-            continue
-        total = aller["prix"] + retour["prix"]
-        if code in deja and total >= deja[code]:
-            continue
-        trouves.append({
-            "code": code, "ville": VILLES_SOLEIL[code], "start": start, "end": end,
-            "depart": d.get("departure_airport_code", ""),
-            "aller": aller, "retour": retour, "total": total,
-        })
+    # Garder le moins cher par destination.
+    meilleur = {}
+    for t in tous:
+        if t["code"] not in meilleur or t["total"] < meilleur[t["code"]]["total"]:
+            meilleur[t["code"]] = t
+
+    # Anti-spam : jamais alerte OU total plus bas qu'avant.
+    trouves = [t for t in meilleur.values()
+               if t["code"] not in deja or t["total"] < deja[t["code"]]]
 
     if not trouves:
         print("Rien de nouveau.")
