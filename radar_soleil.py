@@ -10,7 +10,7 @@ from email.message import EmailMessage
 
 import requests
 
-SEUIL_TRAJET = 50                      # € max billet aller ET € max billet retour
+SEUIL_TRAJET = 100000                     # € max billet aller ET € max billet retour
 FENETRE = "2027-07-01,2027-09-03"      # dates de depart possibles
 FIN = "2027-09-10"                     # retour au plus tard
 DUREE = "7,21"                         # duree du sejour en jours
