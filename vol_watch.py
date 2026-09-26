@@ -3,7 +3,7 @@
 import os
 import smtplib
 import sqlite3
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from email.message import EmailMessage
 
 import requests
@@ -41,17 +41,21 @@ def trajet(departure_id, arrival_id, outbound_date):
     lien = data.get("search_metadata", {}).get("google_flights_url")
     vols = data.get("best_flights", []) + data.get("other_flights", [])
     prix = (data.get("price_insights") or {}).get("lowest_price")
-    compagnie = ""
+    compagnie = h_dep = h_arr = ""
     moins_cher = min((v for v in vols if v.get("price")), key=lambda v: v["price"], default=None)
     if moins_cher:
         if prix is None:
             prix = moins_cher["price"]
+        segs = moins_cher.get("flights", [])
         compagnie = ", ".join(dict.fromkeys(
-            s.get("airline", "") for s in moins_cher.get("flights", []) if s.get("airline")))
+            s.get("airline", "") for s in segs if s.get("airline")))
+        if segs:
+            h_dep = (segs[0].get("departure_airport", {}).get("time", "") or "")[11:16]
+            h_arr = (segs[-1].get("arrival_airport", {}).get("time", "") or "")[11:16]
     if prix is None:
         print(f"[serpapi] {departure_id}->{arrival_id} {outbound_date}: prix indisponible")
         return None
-    return {"prix": prix, "lien": lien, "compagnie": compagnie}
+    return {"prix": prix, "lien": lien, "compagnie": compagnie, "h_dep": h_dep, "h_arr": h_arr}
 
 
 def envoyer_mail(aller, retour, total):
@@ -59,10 +63,11 @@ def envoyer_mail(aller, retour, total):
     msg["Subject"] = f"✈️ Paris-NY {total} € A/R ({aller['prix']} + {retour['prix']})"
     msg["From"] = GMAIL_USER
     msg["To"] = ALERT_TO
+    nuits = (date.fromisoformat(RETOUR) - date.fromisoformat(ALLER)).days
     msg.set_content(
-        f"Paris -> New York aller/retour : {total} €\n\n"
-        f"Aller  {ALLER} : {aller['prix']} € — {aller['compagnie']}\n{aller['lien']}\n\n"
-        f"Retour {RETOUR} : {retour['prix']} € — {retour['compagnie']}\n{retour['lien']}\n"
+        f"Paris -> New York aller/retour : {total} € — {nuits} jours sur place\n\n"
+        f"Aller  {ALLER} {aller['h_dep']}→{aller['h_arr']} : {aller['prix']} € — {aller['compagnie']}\n{aller['lien']}\n\n"
+        f"Retour {RETOUR} {retour['h_dep']}→{retour['h_arr']} : {retour['prix']} € — {retour['compagnie']}\n{retour['lien']}\n"
     )
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
         s.login(GMAIL_USER, GMAIL_APP_PASSWORD)

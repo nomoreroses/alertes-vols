@@ -5,12 +5,12 @@ Deux sources : Google Flights (via SerpApi) + Ryanair (API publique, gratuite)."
 import os
 import smtplib
 import sqlite3
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from email.message import EmailMessage
 
 import requests
 
-SEUIL_TRAJET = 100000                     # € max billet aller ET € max billet retour
+SEUIL_TRAJET = 50                      # € max billet aller ET € max billet retour
 FENETRE = "2027-07-01,2027-09-03"      # dates de depart possibles
 FIN = "2027-09-10"                     # retour au plus tard
 DUREE = "7,21"                         # duree du sejour en jours
@@ -76,16 +76,20 @@ def trajet(departure_id, arrival_id, outbound_date):
     lien = data.get("search_metadata", {}).get("google_flights_url")
     vols = data.get("best_flights", []) + data.get("other_flights", [])
     prix = (data.get("price_insights") or {}).get("lowest_price")
-    compagnie = ""
+    compagnie = h_dep = h_arr = ""
     moins_cher = min((v for v in vols if v.get("price")), key=lambda v: v["price"], default=None)
     if moins_cher:
         if prix is None:
             prix = moins_cher["price"]
+        segs = moins_cher.get("flights", [])
         compagnie = ", ".join(dict.fromkeys(
-            s.get("airline", "") for s in moins_cher.get("flights", []) if s.get("airline")))
+            s.get("airline", "") for s in segs if s.get("airline")))
+        if segs:
+            h_dep = (segs[0].get("departure_airport", {}).get("time", "") or "")[11:16]
+            h_arr = (segs[-1].get("arrival_airport", {}).get("time", "") or "")[11:16]
     if prix is None:
         return None
-    return {"prix": prix, "lien": lien, "compagnie": compagnie}
+    return {"prix": prix, "lien": lien, "compagnie": compagnie, "h_dep": h_dep, "h_arr": h_arr}
 
 
 def ryanair_lien(origine, dest, date_out, date_in):
@@ -138,8 +142,10 @@ def ryanair(depart):
         trouves.append({
             "code": code, "ville": VILLES_SOLEIL[code], "start": start, "end": end,
             "depart": depart,
-            "aller": {"prix": p_aller, "lien": lien, "compagnie": "Ryanair"},
-            "retour": {"prix": p_retour, "lien": lien, "compagnie": "Ryanair"},
+            "aller": {"prix": p_aller, "lien": lien, "compagnie": "Ryanair",
+                      "h_dep": out["departureDate"][11:16], "h_arr": out["arrivalDate"][11:16]},
+            "retour": {"prix": p_retour, "lien": lien, "compagnie": "Ryanair",
+                       "h_dep": inb["departureDate"][11:16], "h_arr": inb["arrivalDate"][11:16]},
             "total": round(p_aller + p_retour, 2),
         })
     return trouves
@@ -177,10 +183,12 @@ def google_flights():
 def envoyer_mail(trouves):
     lignes = []
     for t in trouves:
+        nuits = (date.fromisoformat(t["end"]) - date.fromisoformat(t["start"])).days
+        a, r = t["aller"], t["retour"]
         lignes.append(
-            f"☀️ {t['ville']} ({t['code']}) — {t['total']} € A/R depuis {t['depart']}\n"
-            f"  Aller  {t['start']} : {t['aller']['prix']} € — {t['aller']['compagnie']}\n  {t['aller']['lien']}\n"
-            f"  Retour {t['end']} : {t['retour']['prix']} € — {t['retour']['compagnie']}\n  {t['retour']['lien']}\n"
+            f"☀️ {t['ville']} ({t['code']}) — {t['total']} € A/R depuis {t['depart']} — {nuits} jours sur place\n"
+            f"  Aller  {t['start']} {a['h_dep']}→{a['h_arr']} : {a['prix']} € — {a['compagnie']}\n  {a['lien']}\n"
+            f"  Retour {t['end']} {r['h_dep']}→{r['h_arr']} : {r['prix']} € — {r['compagnie']}\n  {r['lien']}\n"
         )
     msg = EmailMessage()
     msg["Subject"] = f"☀️ {len(trouves)} bons plans soleil"
